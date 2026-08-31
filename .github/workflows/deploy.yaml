@@ -1,0 +1,98 @@
+name: Deploy to EKS
+
+on:
+  push:
+    branches: [ main ]
+    paths:
+      - 'app/**'
+
+# 워크플로 토큰 권한 최소 지정 (기본 권한 의존 제거)
+# id-token: write 는 OIDC로 AWS 역할
+permissions:
+  contents: read
+  id-token: write
+
+env:
+  AWS_REGION: ap-northeast-2
+  ECR_REPOSITORY: health-record-app
+  EKS_CLUSTER: health-record-eks
+  K8S_NAMESPACE: health-record
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: 코드 가져오기
+        uses: actions/checkout@v4
+
+      # 장기 액세스 키 대신 OIDC로 역할
+      # 저장할 키가 없어 유출 시나리오 자체는 사라지며 AWS_ROLE_ARN은 terraform output github_actions_role_arn
+      - name: AWS 자격증명 설정 (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: ECR 로그인
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Docker image Build 및 ECR Push
+        env:
+          ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+          IMAGE_TAG: ${{ github.sha }}
+        run: |
+          docker build -t $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG ./app
+          docker push $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG
+
+      # ECR scan_on_push 결과 배포 전 확인
+      # 스캔만 켜두고 결과 미확인 시 취약 이미지가 그대로 배포되 CRITICAL 1건이라도 발생 시 중단
+      # 푸시 직후 스캔 기록이 없을 수 있어 최대 2분간 10초 간격 재확인
+      - name: 이미지 취약점 스캔 결과 확인
+        env:
+          IMAGE_TAG: ${{ github.sha }}
+        run: |
+          for i in $(seq 1 12); do
+            STATUS=$(aws ecr describe-image-scan-findings \
+              --repository-name $ECR_REPOSITORY --image-id imageTag=$IMAGE_TAG \
+              --query 'imageScanStatus.status' --output text 2>/dev/null || echo "PENDING")
+            echo "scan status: $STATUS ($i/12)"
+            [ "$STATUS" = "COMPLETE" ] && break
+            sleep 10
+          done
+          if [ "$STATUS" != "COMPLETE" ]; then
+            echo "스캔이 완료되지 않아 배포 중단"; exit 1
+          fi
+          CRITICAL=$(aws ecr describe-image-scan-findings \
+            --repository-name $ECR_REPOSITORY --image-id imageTag=$IMAGE_TAG \
+            --query 'imageScanFindings.findingSeverityCounts.CRITICAL' --output text)
+          echo "CRITICAL findings: ${CRITICAL}"
+          if [ "$CRITICAL" != "None" ] && [ "$CRITICAL" -gt 0 ]; then
+            echo "CRITICAL 취약점 발견 → 배포 중단"; exit 1
+          fi
+
+      - name: EKS 배포
+        id: deploy
+        env:
+          ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+          IMAGE_TAG: ${{ github.sha }}
+        run: |
+          aws eks update-kubeconfig --region $AWS_REGION --name $EKS_CLUSTER
+          kubectl -n $K8S_NAMESPACE set image deployment/health-record-app \
+            health-record-app=$ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG
+
+      # 검증 단계가 없으면 새 Pod가 ImagePullBackOff/CrashLoopBackOff여도 파이프라인 성공 후 끝
+      # 이를 방지하는 단계로 readinessProbe와 짝을 이룸
+      # 프로브가 없을 경우 컨테이너 시작 즉시 Ready로 간주되 rollout status 통과
+      - name: 배포 검증
+        id: verify
+        run: |
+          kubectl -n $K8S_NAMESPACE rollout status deployment/health-record-app --timeout=120s
+
+      # 배포 이후 단계 실패 시 롤백 (배포 전 단계 실패는 되돌릴 것 없음)
+      - name: 실패 시 직전 버전으로 롤백
+        if: failure() && (steps.deploy.outcome == 'failure' || steps.verify.outcome == 'failure')
+        run: |
+          kubectl -n $K8S_NAMESPACE rollout undo deployment/health-record-app
+          kubectl -n $K8S_NAMESPACE rollout status deployment/health-record-app --timeout=120s

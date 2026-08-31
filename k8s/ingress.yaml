@@ -1,0 +1,79 @@
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: health-record-ingress
+  namespace: health-record
+  annotations:
+    alb.ingress.kubernetes.io/scheme: internet-facing
+    # Pod IP로 직접 라우팅 (NodePort/kube-proxy 홉 제거)
+    alb.ingress.kubernetes.io/target-type: ip
+    # CloudFront가 HTTPS 종단 CF → ALB 구간 HTTP 80
+    alb.ingress.kubernetes.io/listen-ports: '[{"HTTP": 80}]'
+
+    # ALB 보안그룹을 Terraform이 만든 SG 고정 (CloudFront origin-facing 대역만 80 허용)
+    # <ALB_SG_ID>는 terraform output alb_security_group_id로 치환
+    # ALB → Pod 규칙은 컨트롤러가 노드 SG 자동 추가
+    alb.ingress.kubernetes.io/security-groups: <ALB_SG_ID>
+    alb.ingress.kubernetes.io/manage-backend-security-group-rules: "true"
+
+    # ALB Healthcheck 상세
+    # 기본값 의존 없이 판정 조건 코드 명시
+    # 15초 간격 x 연속 2회 실패는 최대 30초 내 비정상 타깃 격리
+    alb.ingress.kubernetes.io/healthcheck-path: /health
+    alb.ingress.kubernetes.io/healthcheck-interval-seconds: "15"
+    alb.ingress.kubernetes.io/healthcheck-timeout-seconds: "5"
+    alb.ingress.kubernetes.io/healthy-threshold-count: "2"
+    alb.ingress.kubernetes.io/unhealthy-threshold-count: "2"
+    alb.ingress.kubernetes.io/success-codes: "200"
+
+    # 무중단 배포의 타깃 등록 해제 대기 단축
+    # 기본 300초 간 ALB가 종료된 Pod IP 유지로 502 발생 가능
+    # 30초로 단축, Pod쪽 PreStop(20초)과 짝을 이룸
+    alb.ingress.kubernetes.io/target-group-attributes: deregistration_delay.timeout_seconds=30
+
+    # L7 고정 응답 액션
+    # 리스너 규칙에서 백엔드로 보내지 않고 ALB가 직접 403 반환
+    alb.ingress.kubernetes.io/actions.block-internal: >
+      {"type":"fixed-response","fixedResponseConfig":{"contentType":"text/plain","statusCode":"403","messageBody":"Forbidden"}}
+
+    # CloudFront 검증 헤더 조건 (보안그룹 제한과 2중 방어)
+    # X-Origin-Verify 값이 일치하는 요청만 앱 전달, <ORIGIN_SECRET>은 tfvars의 cloudfront_origin_secret과 동일 값
+    alb.ingress.kubernetes.io/conditions.health-record-svc: >
+      [{"field":"http-header","httpHeaderConfig":{"httpHeaderName":"X-Origin-Verify","values":["<ORIGIN_SECRET>"]}}]
+
+spec:
+  ingressClassName: alb
+  rules:
+    - http:
+        paths:
+          # 1) /health는 ALB Healthcheck 전용 경로
+          # 인터넷에서 오는 요청은 403 차단
+          # ALB Healthcheck는 리스너 규칙을 거치지 않고 타깃 그룹으로 직접 수행되며 차단은 헬스체크 동작 영향 없음
+          # (운영용 엔드포인트를 외부에 열어둘 필요 없음)
+          - path: /health
+            pathType: Exact
+            backend:
+              service:
+                name: block-internal
+                port:
+                  name: use-annotation
+
+          # 2) 데이터 계층 연동 검증 경로
+          # 검증용 엔드포인트도 인터넷에 열어둘 필요 없어 앱 경로와 동일하게 CloudFront 헤더 조건을 통과
+          - path: /check
+            pathType: Prefix
+            backend:
+              service:
+                name: health-record-svc
+                port:
+                  number: 80
+
+          # 3) 기본 경로 (catch-all)
+          # 규칙은 위에서부터 평가되며 해당 항목 마지막 기입
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: health-record-svc
+                port:
+                  number: 80

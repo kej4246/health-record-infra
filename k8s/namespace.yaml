@@ -1,0 +1,5 @@
+# 앱 자원 default 분리, GitHub Actions 배포 역할의 EKS 권한도 이 네임스페이스로 한정 (eks.tf access_entries)
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: health-record

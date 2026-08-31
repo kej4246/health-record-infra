@@ -1,0 +1,20 @@
+# Terraform 상태파일 (인프라 정보/비밀값 포함, 업로드 금지)
+.terraform/
+*.tfstate
+*.tfstate.*
+*.tfstate.backup
+crash.log
+
+# 변수파일 example만 커밋 (비밀번호 들어있을 수 있음)
+*.tfvars
+*.tfvars.json
+!terraform.tfvars.example
+
+# AWS 키 관련
+*.pem
+*.csv
+
+# 기타
+.DS_Store
+kubeconfig*
+.vscode/

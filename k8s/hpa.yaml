@@ -1,0 +1,30 @@
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: health-record-hpa
+  namespace: health-record
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: health-record-app
+  minReplicas: 2
+  maxReplicas: 6
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          # HPA 기준은 limits가 아닌 requests(100m), 50% = 50m에서 확장 시작
+          # 부하 테스트로 잡은 값보다 보수적인 초기값, 잦은 확장/축소 차단을 위해 아래 안정화 창
+          averageUtilization: 50
+  behavior:
+    scaleDown:
+      stabilizationWindowSeconds: 300 # 5분간 낮게 유지되 축소
+    scaleUp:
+      stabilizationWindowSeconds: 0
+      policies:
+        - type: Pods
+          value: 2
+          periodSeconds: 60

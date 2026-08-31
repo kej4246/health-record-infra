@@ -1,0 +1,139 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: health-record-app
+  namespace: health-record
+spec:
+  replicas: 2
+  # 롤링 교체 중 가용 Pod가 줄지 않도록 보장
+  # maxUnavailable 0 = 새 Pod가 Ready 되기 전은 옛 Pod 내리지 않음
+  # maxSurge 1 = 교체 중 한 개까지 초과 생성 허용
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 0
+      maxSurge: 1
+  selector:
+    matchLabels:
+      app: health-record-app
+  template:
+    metadata:
+      labels:
+        app: health-record-app
+    spec:
+      # S3 권한은 노드가 아닌 이 서비스 어카운트(IRSA)만 있음
+      serviceAccountName: health-record-app
+      # 종료 전체 상한, preStop(20) + gunicorn graceful(30)은 50초보다 커야 함
+      terminationGracePeriodSeconds: 60
+      # Pod 2개를 서로 다른 AZ로 강제 분산
+      # 분산 제약 없을 시 스케줄러가 같은 노드에 2개를 올릴 수 있어 노드 1대 장애로 전면 중단되고 다중 AZ 무중단 성립 불가
+      # matchLabelKeys 없을 시 롤링 업데이트 중 종료되는 이전 버전 Pod까지 분산 계산
+      # 배포 후 새 Pod가 한 AZ에 몰리는 현상이 실제로 발생 → 같은 ReplicaSet(pod-template-hash)끼리 계산하도록 제한
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: topology.kubernetes.io/zone
+          whenUnsatisfiable: DoNotSchedule
+          labelSelector:
+            matchLabels:
+              app: health-record-app
+          matchLabelKeys:
+            - pod-template-hash
+      # 같은 노드 회피는 선호로 두고 필수로 두면 HPA가 노드 수보다 많이 늘릴 때 스케줄 불가
+      affinity:
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              podAffinityTerm:
+                topologyKey: kubernetes.io/hostname
+                labelSelector:
+                  matchLabels:
+                    app: health-record-app
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+      containers:
+        - name: health-record-app
+          # <계정ID>.dkr.ecr.ap-northeast-2.amazonaws.com/health-record-app:v1는 최초 배포 시 terraform output ecr_repository_url과 첫 커밋 해시로 치환
+          # 이후 CI/CD가 커밋 해시 태그로 kubectl set image (ECR IMMUTABLE이라 latest 재푸시 불가)
+          image: <ECR_REPOSITORY_URL>:<IMAGE_TAG>
+          ports:
+            - containerPort: 8080
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          # 종료 신호 수신 후 20초 대기
+          # target-type ip라 ALB가 Pod IP를 직접 타깃
+          # Pod가 즉시 죽으면 ALB 등록 해제(30초) 전으로 죽은 IP로 요청이 가며 502 발생
+          # preStop(20) < deregistration_delay(30)여야 Pod가 살아있는 동안 해제 끝남
+          lifecycle:
+            preStop:
+              exec:
+                command: ["sh", "-c", "sleep 20"]
+          resources:
+            requests:
+              cpu: "100m"
+              # 메모리 requests가 없으면 스케줄러가 노드 과할당
+              memory: "128Mi"
+            limits:
+              cpu: "200m"
+              # 메모리 limits가 없으면 누수 시 노드 전체가 압박받아 다른 Pod 축출
+              memory: "256Mi"
+          # 컨테이너가 요청 받을 준비 → 롤링 업데이트 중 503 방지
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 8080
+            initialDelaySeconds: 5
+            periodSeconds: 5
+          # 프로세스가 살아있으나 응답이 어려운 교착상태 감지 자동 재시작
+          # /health는 DB를 확인하지 않는다 → DB 장애가 Pod 재시작 연쇄 전이 불가
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 8080
+            initialDelaySeconds: 15
+            periodSeconds: 20
+          envFrom:
+            # DB_HOST / DB_NAME / DB_USER / S3_BUCKET
+            # 환경 의존 값을 저장소에 두지 않고 ConfigMap 분리
+            - configMapRef:
+                name: app-config
+          env:
+            - name: DB_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: db-secret
+                  key: password
+          # readOnlyRootFilesystem으로 gunicorn 임시파일 경로만 쓰기 가능하게 마운트
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: tmp
+          emptyDir: {}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: health-record-svc
+  namespace: health-record
+spec:
+  selector:
+    app: health-record-app
+  ports:
+    - port: 80
+      targetPort: 8080
+---
+# 노드 교체/드레인 중 최소 1개 살아있도록 보장
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: health-record-pdb
+  namespace: health-record
+spec:
+  minAvailable: 1
+  selector:
+    matchLabels:
+      app: health-record-app

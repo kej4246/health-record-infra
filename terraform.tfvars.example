@@ -1,0 +1,6 @@
+# 복사해서 terraform.tfvars로 저장 (terraform.tfvars는 gitignore 대상)
+db_password = "CHANGE_ME"
+alert_email = "you@example.com"
+github_repo = "github-owner/health-record-infra"
+cloudfront_origin_secret = "CHANGE_ME_RANDOM_STRING"
+alb_created = false # Ingress 적용 후 true
